@@ -1,0 +1,38 @@
+#
+# Copyright 2013-2017 Nathan L. Conrad
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program; if not, write to the Free Software Foundation, Inc., 51
+# Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Nathan L. Conrad <nathan@noreply.alt-teknik.com>
+#
+
+if PHYLIB
+
+comment "MII PHY device drivers"
+
+# Insert this configuration into the 'MII PHY device drivers' menu
+config KSZ8895
+	tristate "Micrel/Microchip KSZ8895 PHY-mode switch"
+	depends on OF
+	---help---
+	  Supports the PHY-mode Micrel/Microchip KSZ8895 5-port switch using
+	  SMI.  The switch and 5th on-chip PHY act as fake PHYs on a fake MIIM
+	  (MDIO) bus.  This allows the switch to integrate with a MAC as if it
+	  were a PHY while the driver controls the actual MIIM bus in the
+	  non-standard SMI mode to monitor and control the switch and PHYs. The
+	  SMI spreads the switch register addresses across the register
+	  addresses of multiple PHY addresses on the MIIM bus.
+
+endif # PHYLIB

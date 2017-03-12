@@ -1,0 +1,50 @@
+linux-ksz8895
+
+Copyright 2013-2017 Nathan L. Conrad
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, write to the Free Software Foundation, Inc., 51 Franklin
+Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+Nathan L. Conrad <nathan@noreply.alt-teknik.com>
+
+
+Microchip (formerly Micrel) KSZ8895 Linux device driver
+
+Originally created to expand the single Ethernet port capabilities of a custom
+OEM Ethernet router/gateway style device.  The device required multiple LAN
+ports and a separate WAN port which is typical of these types of devices.  With
+the KSZ8895, this can be achieved in two different ways:
+
+  - Using two MACs – one connected to the 5-port switch for the LAN and the
+    other connected to a 5th on-chip PHY for the WAN – the first 4 PHYs being
+    attached to the switch
+  - Using a single MAC and configuring VLANs on both the switch and Linux
+    network interface to isolate LAN and WAN traffic.  The VLAN tags can also
+    be removed on the egress of the 4 switch ports with attached PHYs.
+
+Once upon a time, Micrel provided a driver for similar devices which they
+claimed worked with earlier kernel builds.  However, it seemed to be poorly
+designed, was not configurable without driver modification, and did not
+function reliably.
+
+With this driver, the switch and 5th on-chip PHY act as fake PHYs on a fake
+MIIM (MDIO) bus.  This allows the switch to easily integrate with a MAC as if
+it were a PHY while the driver controls the actual MIIM bus in the non-standard
+SMI mode to monitor and control the switch and PHYs.  The SMI simply spreads
+the switch register addresses across the register addresses of multiple PHY
+addresses on the MIIM bus.
+
+The driver should drop into the version 4.9 stable kernel without modification
+as this is what it was most recently tested against.  However, it was
+originally developed for 3.8; so it should also work reliably for everything
+between if you give some of the API calls (which changed) a little massaging.
