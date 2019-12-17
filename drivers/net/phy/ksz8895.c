@@ -4,6 +4,7 @@
  * Driver for the PHY-mode Micrel/Microchip KSZ8895 5-port switch using SMI
  *
  * Author: Nathan L. Conrad <nathan@noreply.alt-teknik.com>
+ *         Greg Malysa <greg.malysa@timesys.com>
  *
  * Copyright (c) 2013 - 2017 Nathan L. Conrad
  *
@@ -21,6 +22,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_mdio.h>
 #include <linux/errno.h>
+#include <linux/sysfs.h>
 
 #define KSZ8895_PHY_ID			0x00221450
 #define KSZ8895_PHY_ID_MASK		0xFFFFFFFF
@@ -123,6 +125,13 @@
 #define KSZ8895_MAXIMUM_VLAN_FID	127
 #define KSZ8895_VLAN_ENTRY_MEMBER_SHIFT	7
 
+struct ksz8895_vlan_entry {
+	u16 id;
+	bool valid;
+	u8 fid;
+	u8 membership;
+};
+
 struct ksz8895_data {
 	struct device *dev;
 
@@ -141,12 +150,12 @@ struct ksz8895_data {
 	 * need to be read repeatedly
 	 */
 	u8 *cache;
-};
 
-struct ksz8895_vlan_entry {
-	u16 id;
-	u8 fid;
-	u8 membership;
+	/* vlan table is a kset of entries */
+	struct kset *vlan_entries;
+
+	struct kset *ports;
+
 };
 
 struct ksz8895_smi_override {
@@ -156,6 +165,298 @@ struct ksz8895_smi_override {
 
 	/* True if there is a register for each port */
 	bool port;
+};
+
+/* Forward declarations of all functions in this module for included files to see them */
+static ssize_t vlan_export_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t vlan_enable_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t vlan_enable_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t vlan_unexport_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count);
+
+static int ksz8895_smi_regnum_to_mii_addr(u8 regnum);
+static u32 ksz8895_smi_regnum_to_mii_regnum(u8 regnum);
+static int ksz8895_smi_read(struct ksz8895_data *data, u8 regnum);
+static int ksz8895_smi_cached_read(struct ksz8895_data *data, u8 regnum);
+static int ksz8895_smi_write(struct ksz8895_data *data, u8 regnum, u8 val);
+static int ksz8895_smi_modify(struct ksz8895_data *data, u8 regnum, u8 mask, u8 val);
+static int ksz8895_mii_read(struct ksz8895_data *data, int addr, u32 regnum);
+static int ksz8895_read(struct mii_bus *bus, int phy_id, int regnum);
+static int ksz8895_write(struct mii_bus *bus, int phy_id, int regnum, u16 val);
+
+static int ksz8895_read_vlan_entry(struct ksz8895_data *data, struct ksz8895_vlan_entry *vlan);
+static int ksz8895_trigger_vlan_table_access(struct ksz8895_data *data, u16 addr, bool read);
+static int ksz8895_write_vlan_entry(struct ksz8895_data *data,
+	struct ksz8895_vlan_entry *entry, bool valid);
+
+static int ksz8895_probe_vlan_table(struct ksz8895_data *data);
+static int ksz8895_probe_default_tags(struct ksz8895_data *data);
+static int ksz8895_probe_smi_overrides(struct ksz8895_data *data);
+static int ksz8895_probe_cache(struct ksz8895_data *data);
+static int ksz8895_probe_device_tree(struct ksz8895_data *data);
+static void ksz8895_free_data(struct ksz8895_data *data);
+static int ksz8895_probe(struct platform_device *pdev);
+static int ksz8895_remove(struct platform_device *pdev);
+
+static int ksz8895_set_supported(struct phy_device *phydev);
+static int ksz8895_switch_config_init(struct phy_device *phydev);
+static int ksz8895_phy_5_config_init(struct phy_device *phydev);
+
+#include "ksz8895_vlan.c"
+#include "ksz8895_port.c"
+
+static ssize_t vlan_export_store(
+	struct device *dev,
+	struct device_attribute *attr,
+	const char *buf,
+	size_t count)
+{
+	char vlan_name[32];
+	struct kobject *kobj;
+	struct ksz8895_sysfs_vlan_entry *entry;
+	struct ksz8895_data *ksz8895;
+	unsigned long vid;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &vid);
+	if (ret)
+		return ret;
+
+	if (vid > KSZ8895_MAXIMUM_VLAN_ID)
+		return -EINVAL;
+
+ 	scnprintf(vlan_name, sizeof(vlan_name), "vlan%lu", vid);
+
+	dev_info(dev, "ksz vlan_export request for %lu\n", vid);
+	ksz8895 = dev_get_drvdata(dev);
+
+	kobj = kset_find_obj(ksz8895->vlan_entries, vlan_name);
+	if (kobj) {
+		dev_dbg(dev, "found matching vlan entry, reusing it.\n");
+		kobject_put(kobj);
+		goto done;
+	}
+
+	dev_dbg(dev, "creating vlan entry named %s\n", vlan_name);
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	entry->ksz8895 = ksz8895;
+	entry->entry.id = (uint16_t) vid;
+	ret = ksz8895_read_vlan_entry(ksz8895, &entry->entry);
+	if (ret) {
+		kfree(entry);
+		return -EIO;
+	}
+
+	entry->kobj.kset = ksz8895->vlan_entries;
+	ret = kobject_init_and_add(&entry->kobj, &ksz8895_vlan_type, NULL, "vlan%lu", vid);
+	if (ret) {
+		kobject_put(&entry->kobj);
+		return -EIO;
+	}
+
+	kobject_uevent(&entry->kobj, KOBJ_ADD);
+
+done:
+	return count;
+}
+
+static ssize_t vlan_enable_show(
+	struct device *dev,
+	struct device_attribute *attr,
+	char *buf)
+{
+	struct ksz8895_data *data;
+	int ret;
+
+	data = dev_get_drvdata(dev);
+	ret = ksz8895_smi_read(data, KSZ8895_GLOBAL_CONTROL_3);
+	if (ret < 0)
+		return ret;
+
+	ret = (ret & KSZ8895_VLAN_ENABLE) ? 1 : 0;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", ret);
+}
+
+static ssize_t vlan_enable_store(
+	struct device *dev,
+	struct device_attribute *attr,
+	const char *buf,
+	size_t count)
+{
+	bool enable;
+	int ret;
+	struct ksz8895_data *data = dev_get_drvdata(dev);
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	ret = ksz8895_smi_modify(data,
+	                   KSZ8895_GLOBAL_CONTROL_3,
+					   KSZ8895_VLAN_ENABLE,
+					   enable ? KSZ8895_VLAN_ENABLE : 0);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t vlan_unexport_store(
+	struct device *dev,
+	struct device_attribute *attr,
+	const char *buf,
+	size_t count)
+{
+	char vlan_name[32];
+	struct kobject *kobj;
+	struct ksz8895_data *ksz8895;
+	unsigned long vid;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &vid);
+	if (ret)
+		return ret;
+
+ 	scnprintf(vlan_name, sizeof(vlan_name), "vlan%lu", vid);
+
+	dev_info(dev, "ksz vlan_unexport request for %lu\n", vid);
+	ksz8895 = dev_get_drvdata(dev);
+
+	kobj = kset_find_obj(ksz8895->vlan_entries, vlan_name);
+	if (kobj) {
+		dev_dbg(dev, "found matching vlan entry, removing it.\n");
+		kobject_put(kobj);
+		kobject_put(kobj);
+		return count;
+	}
+
+	return -EINVAL;
+}
+
+struct ksz8895_control_attribute {
+	struct device_attribute attr;
+	u8 regnum;
+};
+
+#define to_ksz8895_control_attribute(c) container_of(c, struct ksz8895_control_attribute, attr)
+
+static ssize_t ksz8895_control_show(
+	struct device *dev,
+	struct device_attribute *attr,
+	char *buf)
+{
+	struct ksz8895_data *ksz8895;
+	struct ksz8895_control_attribute *control;
+	int ret;
+
+	control = to_ksz8895_control_attribute(attr);
+	ksz8895 = dev_get_drvdata(dev);
+
+	ret = ksz8895_smi_read(ksz8895, control->regnum);
+	if (ret < 0)
+		return ret;
+
+	return scnprintf(buf, PAGE_SIZE, "0x%02x\n", ret);
+}
+
+static ssize_t ksz8895_control_store(
+	struct device *dev,
+	struct device_attribute *attr,
+	const char *buf,
+	size_t count)
+{
+	struct ksz8895_data *ksz8895;
+	struct ksz8895_control_attribute *control;
+	int ret;
+	int value;
+
+	control = to_ksz8895_control_attribute(attr);
+	ksz8895 = dev_get_drvdata(dev);
+
+	ret = kstrtoint(buf, 10, &value);
+	if (ret)
+		return ret;
+
+	if (value > 0xff)
+		return -EINVAL;
+
+	ret = ksz8895_smi_write(ksz8895, control->regnum, (u8) value);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+#define KSZ8895_CONTROL_ATTR(name, num) \
+static struct ksz8895_control_attribute control_attr_##name = { \
+	.attr = __ATTR( \
+		name, \
+		(S_IWUSR | S_IRUGO), \
+		ksz8895_control_show, \
+		ksz8895_control_store \
+	), \
+	.regnum = num \
+}
+
+static DEVICE_ATTR_WO(vlan_export);
+static DEVICE_ATTR_RW(vlan_enable);
+static DEVICE_ATTR_WO(vlan_unexport);
+KSZ8895_CONTROL_ATTR(chipid0, 0);
+KSZ8895_CONTROL_ATTR(chipid1, 1);
+KSZ8895_CONTROL_ATTR(control0, 2);
+KSZ8895_CONTROL_ATTR(control1, 3);
+KSZ8895_CONTROL_ATTR(control2, 4);
+KSZ8895_CONTROL_ATTR(control3, 5);
+KSZ8895_CONTROL_ATTR(control4, 6);
+KSZ8895_CONTROL_ATTR(control5, 7);
+/* control6-8 are factory test regs and should not be modified */
+KSZ8895_CONTROL_ATTR(control9, 11);
+KSZ8895_CONTROL_ATTR(control10, 12);
+/* control11 is a factory test register */
+KSZ8895_CONTROL_ATTR(power_control1, 14);
+KSZ8895_CONTROL_ATTR(power_control2, 15);
+
+KSZ8895_CONTROL_ATTR(control19, 135);
+
+/* @todo add "advanced control registers" here */
+
+#define DEVICE_ATTR(_name, _mode, _show, _store) \
+	struct device_attribute dev_attr_##_name = __ATTR(_name, _mode, _show, _store)
+
+static struct attribute *ksz8895_attrs[] = {
+	&dev_attr_vlan_export.attr,
+	&dev_attr_vlan_enable.attr,
+	&dev_attr_vlan_unexport.attr,
+	&control_attr_chipid0.attr.attr,
+	&control_attr_chipid1.attr.attr,
+	&control_attr_control0.attr.attr,
+	&control_attr_control1.attr.attr,
+	&control_attr_control2.attr.attr,
+	&control_attr_control3.attr.attr,
+	&control_attr_control4.attr.attr,
+	&control_attr_control5.attr.attr,
+	&control_attr_control9.attr.attr,
+	&control_attr_control10.attr.attr,
+	&control_attr_power_control1.attr.attr,
+	&control_attr_power_control2.attr.attr,
+	&control_attr_control19.attr.attr,
+	NULL
+};
+
+static struct attribute_group ksz_device_attrs = {
+	.attrs = ksz8895_attrs
+};
+
+static const struct attribute_group *ksz_attr_groups[] = {
+	&ksz_device_attrs,
+	NULL
 };
 
 static int ksz8895_smi_regnum_to_mii_addr(u8 regnum)
@@ -322,10 +623,73 @@ static int ksz8895_write(struct mii_bus *bus, int phy_id, int regnum, u16 val)
 	return 0;
 }
 
-static int ksz8895_match_device_class(struct device *dev, void *class)
-{
-	if (dev->class && !strcmp(dev->class->name, class))
-		return 1;
+#define VLAN_BIT_READ(data, out, reg, ret, mask, shift) \
+	do { \
+		ret = ksz8895_smi_read(data, reg); \
+		if (ret < 0) \
+			return ret; \
+		dev_dbg(data->dev, "vlan read: reg %d = 0x%02x\n", reg, ret); \
+		out |= (uint16_t) ((ret & mask) << shift); \
+	} while (0)
+
+#define VLAN_BIT_READ_RIGHT(data, out, reg, ret, mask, shift) \
+	do { \
+		ret = ksz8895_smi_read(data, reg); \
+		if (ret < 0) \
+			return ret; \
+		dev_dbg(data->dev, "vlan read: reg %d = 0x%02x\n", reg, ret); \
+		out |= (uint16_t) ((ret & mask) >> shift); \
+	} while (0)
+
+/**
+ * Read the vlan table entry for the given vlan id
+ * @vlan->id must be set to the id to read
+ */
+static int ksz8895_read_vlan_entry(
+	struct ksz8895_data *data,
+	struct ksz8895_vlan_entry *vlan
+) {
+	uint16_t offset = vlan->id / KSZ8895_INDIRECT_VLAN_TABLES;
+	uint16_t which = vlan->id % KSZ8895_INDIRECT_VLAN_TABLES;
+	uint16_t vlan_bits = 0;
+	int ret;
+
+	/* load all four vlan entries to indirect access registers */
+	ret = ksz8895_trigger_vlan_table_access(data, offset, true);
+	if (ret < 0)
+		return ret;
+
+	dev_dbg(data->dev, "which = %d\n", which);
+
+	/* read out 13 bit record based on which vlan entry we're looking for */
+	switch (which) {
+	case 0:
+		VLAN_BIT_READ(data, vlan_bits, 120, ret, 0xff, 0);
+		VLAN_BIT_READ(data, vlan_bits, 119, ret, 0x1f, 8);
+		break;
+	case 1:
+		VLAN_BIT_READ_RIGHT(data, vlan_bits, 119, ret, 0xe0, 5);
+		VLAN_BIT_READ(data, vlan_bits, 118, ret, 0xff, 3);
+		VLAN_BIT_READ(data, vlan_bits, 117, ret, 0x03, 11);
+		break;
+	case 2:
+		VLAN_BIT_READ_RIGHT(data, vlan_bits, 117, ret, 0xfc, 2);
+		VLAN_BIT_READ(data, vlan_bits, 116, ret, 0x7f, 6);
+		break;
+	case 3:
+	default:
+		VLAN_BIT_READ_RIGHT(data, vlan_bits, 116, ret, 0x80, 7);
+		VLAN_BIT_READ(data, vlan_bits, 115, ret, 0xff, 1);
+		VLAN_BIT_READ(data, vlan_bits, 114, ret, 0x0f, 9);
+		break;
+	}
+
+	dev_dbg(data->dev, "read vlan entry %d as 0x%04x\n", vlan->id, vlan_bits);
+
+	/* parse vlan table entry into data structure */
+	vlan->valid = (vlan_bits >> 12) & 0x01;
+	vlan->membership = (vlan_bits >> 7) & 0x1f;
+	vlan->fid = vlan_bits & 0x7f;
 	return 0;
 }
 
@@ -683,8 +1047,7 @@ static int ksz8895_probe_cache(struct ksz8895_data *data)
 static int ksz8895_probe_device_tree(struct ksz8895_data *data)
 {
 	const __be32 *bus;
-	struct platform_device *pdev;
-	struct device *dev;
+	struct device_node *node;
 	const char *id;
 	int val;
 
@@ -706,20 +1069,20 @@ static int ksz8895_probe_device_tree(struct ksz8895_data *data)
 		dev_err(data->dev, "Missing device tree 'bus' property\n");
 		return -EINVAL;
 	}
-	pdev = of_find_device_by_node(of_find_node_by_phandle(
-				      be32_to_cpup(bus)));
-	if (!pdev) {
+
+	node = of_find_node_by_phandle(be32_to_cpup(bus));
+	if (!node) {
+		dev_err(data->dev,
+			"Failed to find the MII/SMI node phandle\n");
+		return -EPROBE_DEFER;
+	}
+
+	data->bus = of_mdio_find_bus(node);
+	if (!data->bus) {
 		dev_err(data->dev,
 			"Failed to find the MII/SMI platform device\n");
 		return -EPROBE_DEFER;
 	}
-	dev = device_find_child(&pdev->dev, "mdio_bus",
-				ksz8895_match_device_class);
-	if (!dev) {
-		dev_err(data->dev, "Failed to find the MII/SMI device\n");
-		return -ENODEV;
-	}
-	data->bus = to_mii_bus(dev);
 	dev_info(data->dev, "Using '%s' for MII/SMI\n", data->bus->name);
 
 	/* Ensures the family ID is correct */
@@ -773,9 +1136,8 @@ static int ksz8895_probe_device_tree(struct ksz8895_data *data)
 
 static void ksz8895_free_data(struct ksz8895_data *data)
 {
-	if (data->switch_bus)
-		mdiobus_free(data->switch_bus);
-	kfree(data->cache);
+	if (data->cache)
+		kfree(data->cache);
 	kfree(data);
 }
 
@@ -784,7 +1146,9 @@ static int ksz8895_probe(struct platform_device *pdev)
 	/* Allocates the private driver data */
 	struct ksz8895_data *data = kzalloc(sizeof(*data), GFP_KERNEL);
 	struct phy_device *phydev;
-	int ret;
+	int ret = 0;
+	struct ksz8895_sysfs_port *ports[5] = { 0 };
+	int i;
 
 	if (!data) {
 		dev_err(&pdev->dev, "Failed to allocate private driver data\n");
@@ -795,17 +1159,15 @@ static int ksz8895_probe(struct platform_device *pdev)
 
 	/* Probes the device tree */
 	ret = ksz8895_probe_device_tree(data);
-	if (ret) {
-		ksz8895_free_data(data);
-		return ret;
-	}
+	if (ret)
+		goto data_free;
 
 	/* Allocates and initializes a pseudo MII bus for the switch */
 	data->switch_bus = mdiobus_alloc();
 	if (!data->switch_bus) {
 		dev_err(data->dev, "Failed to allocate MII bus\n");
-		ksz8895_free_data(data);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto data_free;
 	}
 	data->switch_bus->name = dev_name(data->dev);
 	snprintf(data->switch_bus->id, MII_BUS_ID_SIZE, "%s", pdev->name);
@@ -819,27 +1181,89 @@ static int ksz8895_probe(struct platform_device *pdev)
 	ret = of_mdiobus_register(data->switch_bus, data->dev->of_node);
 	if (ret) {
 		dev_err(data->dev, "Failed to register MII bus\n");
-		ksz8895_free_data(data);
-		return ret;
+		goto mdio_free;
 	}
 
 	/* Ensures a switch PHY driver was found */
 	phydev = mdiobus_get_phy(data->switch_bus, KSZ8895_SWITCH_ADDR);
 	if (!phydev || !phydev->drv) {
 		dev_err(data->dev, "Failed to find a switch PHY driver\n");
-		mdiobus_unregister(data->switch_bus);
-		ksz8895_free_data(data);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto mdio_unreg;
 	}
 	dev_info(data->dev, "Detected PHY driver '%s'\n", phydev->drv->name);
+
+	/* Create sysfs interface */
+	ret = device_add_groups(data->dev, ksz_attr_groups);
+	if (ret) {
+		dev_err(data->dev, "Failed to create sysfs entries: %d\n", ret);
+		goto mdio_unreg;
+	}
+
+	data->vlan_entries = kset_create_and_add("vlans", NULL, &data->dev->kobj);
+	if (!data->vlan_entries) {
+		ret = -ENOMEM;
+		dev_err(data->dev, "Failed to create vlan kset.\n");
+		goto mdio_unreg;
+	}
+
+	data->ports = kset_create_and_add("ports", NULL, &data->dev->kobj);
+	if (!data->ports) {
+		ret = -ENOMEM;
+		dev_err(data->dev, "Failed to create port kset.\n");
+		goto vlan_cleanup;
+	}
+
+	/* Create entries for each port on the switch */
+	for (i = 0; i < 5; ++i) {
+		ports[i] = kzalloc(sizeof(*ports[i]), GFP_KERNEL);
+		if (!ports[i]) {
+			ret = -ENOMEM;
+			goto port_cleanup;
+		}
+
+		ports[i]->ksz8895 = data;
+		ports[i]->id = (uint8_t) (i + 1);
+		ports[i]->regbase = (u8) (0x10 * (i+1));
+		ports[i]->kobj.kset = data->ports;
+		ret = kobject_init_and_add(&ports[i]->kobj, &ksz8895_port_type, NULL, "port%d", i+1);
+		if (ret) {
+			ret = -EIO;
+			goto port_cleanup;
+		}
+
+		kobject_uevent(&ports[i]->kobj, KOBJ_ADD);
+	}
+
 	return 0;
+
+	port_cleanup:
+		for (i = 0; i < 5; ++i) {
+			if (ports[i]) {
+				kobject_put(&ports[i]->kobj);
+			}
+		}
+	vlan_cleanup:
+		kset_unregister(data->vlan_entries);
+	mdio_unreg:
+		mdiobus_unregister(data->switch_bus);
+	mdio_free:
+		mdiobus_free(data->switch_bus);
+	data_free:
+		ksz8895_free_data(data);
+	return ret;
 }
 
 static int ksz8895_remove(struct platform_device *pdev)
 {
 	struct ksz8895_data *data = platform_get_drvdata(pdev);
 
+	// @todo need to iterate ports and vlan entries ksets and put objects
+
+	kset_unregister(data->ports);
+	kset_unregister(data->vlan_entries);
 	mdiobus_unregister(data->switch_bus);
+	mdiobus_free(data->switch_bus);
 	ksz8895_free_data(data);
 	return 0;
 }
