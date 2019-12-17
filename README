@@ -44,7 +44,34 @@ SMI mode to monitor and control the switch and PHYs.  The SMI simply spreads
 the switch register addresses across the register addresses of multiple PHY
 addresses on the MIIM bus.
 
-The driver should drop into the version 4.9 stable kernel without modification
+The driver should drop into the version 4.14 stable kernel without modification
 as this is what it was most recently tested against.  However, it was
 originally developed for 3.8; so it should also work reliably for everything
 between if you give some of the API calls (which changed) a little massaging.
+
+
+Example DTS fragment
+
+If `fec1` is connected to the P5 MAC interface physically, and `mdio_bus` is
+defined somewhere (often in the fec1 node or in fec2).
+
+	ksz8895 {
+		compatible = "microchip,ksz8895";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		bus = <&mdio_bus>;
+		start-switch = <1>;
+		status = "okay";
+
+		port@0 {
+			compatible = "ethernet-phy-id0022.1450";
+			reg = <0>;
+			label = "switch0";
+			ethernet = <&fec1>;
+			fixed-link {
+				speed = <100>;
+				full-duplex;
+			};
+		};
+	};
