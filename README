@@ -63,6 +63,7 @@ defined somewhere (often in the fec1 node or in fec2).
 		bus = <&mdio_bus>;
 		start-switch = <1>;
 		status = "okay";
+		soft-reset-gpios = <&gpio1 1 GPIO_ACTIVE_LOW>;
 
 		port@0 {
 			compatible = "ethernet-phy-id0022.1450";

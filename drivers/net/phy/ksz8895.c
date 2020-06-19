@@ -23,6 +23,9 @@
 #include <linux/of_mdio.h>
 #include <linux/errno.h>
 #include <linux/sysfs.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+#include <linux/gpio.h>
 
 #define KSZ8895_PHY_ID			0x00221450
 #define KSZ8895_PHY_ID_MASK		0xFFFFFFFF
@@ -156,6 +159,9 @@ struct ksz8895_data {
 
 	struct kset *ports;
 
+	struct gpio_desc *reset;
+	struct work_struct reset_work;
+
 };
 
 struct ksz8895_smi_override {
@@ -199,6 +205,7 @@ static int ksz8895_probe_device_tree(struct ksz8895_data *data);
 static void ksz8895_free_data(struct ksz8895_data *data);
 static int ksz8895_probe(struct platform_device *pdev);
 static int ksz8895_remove(struct platform_device *pdev);
+static void ksz8895_soft_reset_work(struct work_struct *work);
 
 static int ksz8895_set_supported(struct phy_device *phydev);
 static int ksz8895_switch_config_init(struct phy_device *phydev);
@@ -340,6 +347,21 @@ static ssize_t vlan_unexport_store(
 	return -EINVAL;
 }
 
+static ssize_t soft_reset_store(
+	struct device *dev,
+	struct device_attribute *attr,
+	const char *buf,
+	size_t count)
+{
+	struct ksz8895_data *ksz8895;
+
+	ksz8895 = dev_get_drvdata(dev);
+
+	schedule_work(&ksz8895->reset_work);
+
+	return count;
+}
+
 struct ksz8895_control_attribute {
 	struct device_attribute attr;
 	u8 regnum;
@@ -408,6 +430,7 @@ static struct ksz8895_control_attribute control_attr_##name = { \
 static DEVICE_ATTR_WO(vlan_export);
 static DEVICE_ATTR_RW(vlan_enable);
 static DEVICE_ATTR_WO(vlan_unexport);
+static DEVICE_ATTR_WO(soft_reset);
 KSZ8895_CONTROL_ATTR(chipid0, 0);
 KSZ8895_CONTROL_ATTR(chipid1, 1);
 KSZ8895_CONTROL_ATTR(control0, 2);
@@ -427,13 +450,11 @@ KSZ8895_CONTROL_ATTR(control19, 135);
 
 /* @todo add "advanced control registers" here */
 
-#define DEVICE_ATTR(_name, _mode, _show, _store) \
-	struct device_attribute dev_attr_##_name = __ATTR(_name, _mode, _show, _store)
-
 static struct attribute *ksz8895_attrs[] = {
 	&dev_attr_vlan_export.attr,
 	&dev_attr_vlan_enable.attr,
 	&dev_attr_vlan_unexport.attr,
+	&dev_attr_soft_reset.attr,
 	&control_attr_chipid0.attr.attr,
 	&control_attr_chipid1.attr.attr,
 	&control_attr_control0.attr.attr,
@@ -1141,6 +1162,15 @@ static void ksz8895_free_data(struct ksz8895_data *data)
 	kfree(data);
 }
 
+static void ksz8895_reset(struct ksz8895_data *data) {
+	if (!data->reset)
+		return;
+	
+	gpiod_set_value(data->reset, 1);
+	mdelay(1);
+	gpiod_set_value(data->reset, 0);
+}
+
 static int ksz8895_probe(struct platform_device *pdev)
 {
 	/* Allocates the private driver data */
@@ -1156,6 +1186,11 @@ static int ksz8895_probe(struct platform_device *pdev)
 	}
 	dev_set_drvdata(&pdev->dev, data);
 	data->dev = &pdev->dev;
+
+	INIT_WORK(&data->reset_work, ksz8895_soft_reset_work);
+	data->reset = devm_gpiod_get_optional(data->dev, "soft-reset", GPIOD_OUT_LOW);
+
+	ksz8895_reset(data);
 
 	/* Probes the device tree */
 	ret = ksz8895_probe_device_tree(data);
@@ -1284,6 +1319,16 @@ static struct platform_driver ksz8895_platform_driver = {
 	.probe = ksz8895_probe,
 	.remove = ksz8895_remove,
 };
+
+static void ksz8895_soft_reset_work(struct work_struct *work) {
+	struct ksz8895_data *data = container_of(work, struct ksz8895_data, reset_work);
+	int ret = 0;
+
+	ksz8895_reset(data);
+	ret = ksz8895_probe_device_tree(data);
+	if (ret)
+		dev_err(data->dev, "Unexpected error during soft-reset of switch!\n");
+}
 
 static int ksz8895_set_supported(struct phy_device *phydev)
 {
