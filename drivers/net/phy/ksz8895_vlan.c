@@ -70,6 +70,20 @@ static int ksz8895_sysfs_vlan_write(struct ksz8895_sysfs_vlan_entry *entry) {
 }
 
 /**
+ * Raw entry access
+ */
+static ssize_t vlan_entry_show(
+	struct ksz8895_sysfs_vlan_entry *entry,
+	struct ksz8895_vlan_attribute *attr,
+	char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "valid: %d\nfid: 0x%02x\nmembers: 0x%02x\n",
+		entry->entry.valid,
+		entry->entry.fid,
+		entry->entry.membership);
+}
+
+/**
  * Add a port to the vlan membership list
  */
 static ssize_t vlan_add_port_store(
@@ -137,7 +151,7 @@ static ssize_t vlan_ports_store(
 	if (ret)
 		return ret;
 
-	return 0;
+	return count;
 }
 
 static ssize_t vlan_remove_port_store(
@@ -241,6 +255,13 @@ static ssize_t vlan_valid_store(
 	return count;
 }
 
+static struct ksz8895_vlan_attribute attr_vlan_entry = __ATTR(
+	entry,
+	S_IRUGO,
+	vlan_entry_show,
+	NULL
+);
+
 static struct ksz8895_vlan_attribute attr_vlan_add_port = __ATTR(
 	add_port,
 	S_IWUSR,
@@ -277,6 +298,7 @@ static struct ksz8895_vlan_attribute attr_vlan_valid = __ATTR(
 );
 
 static struct attribute *ksz8895_vlan_default_attrs[] = {
+	&attr_vlan_entry.attr,
 	&attr_vlan_add_port.attr,
 	&attr_vlan_ports.attr,
 	&attr_vlan_remove_port.attr,

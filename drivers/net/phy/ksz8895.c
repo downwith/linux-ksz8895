@@ -1165,7 +1165,7 @@ static void ksz8895_free_data(struct ksz8895_data *data)
 static void ksz8895_reset(struct ksz8895_data *data) {
 	if (!data->reset)
 		return;
-	
+
 	gpiod_set_value(data->reset, 1);
 	mdelay(1);
 	gpiod_set_value(data->reset, 0);
